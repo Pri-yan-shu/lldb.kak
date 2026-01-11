@@ -1,5 +1,16 @@
-#include "lldb/lldb-enumerations.h"
-#include <lldb/API/LLDB.h>
+#include "lldb/API/SBBreakpointLocation.h"
+#include "lldb/API/SBCommandInterpreter.h"
+#include "lldb/API/SBDebugger.h"
+#include "lldb/API/SBDeclaration.h"
+#include "lldb/API/SBEvent.h"
+#include "lldb/API/SBFunction.h"
+#include "lldb/API/SBLineEntry.h"
+#include "lldb/API/SBListener.h"
+#include "lldb/API/SBStream.h"
+#include "lldb/API/SBStringList.h"
+#include "lldb/API/SBThread.h"
+#include "lldb/API/SBValue.h"
+#include "lldb/API/SBValueList.h"
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -8,25 +19,33 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
+#include <unordered_map>
 
 using namespace lldb;
 
 bool running = true;
-SBDebugger *debugger = nullptr;
 std::unordered_map<uint16_t, const char *> line_flags;
 
 const char *pwd;
-char kak_cmd_string[64];
-char path_breakpoints[64];
-char path_watchpoints[64];
-char path_threads[64];
-char path_frames[64];
-char path_frame[64];
+char kak_cmd_string[256];
+char path_breakpoints[256];
+char path_watchpoints[256];
+char path_threads[256];
+char path_frames[256];
+char path_frame[256];
 
+bool jump_at_stop = true;
 bool trace_all_threads = false;
+bool hide_underscore_frames = true;
 uint8_t trace_max_depth = 0;
 uint8_t frame_max_depth = 1;
 uint16_t jump_line = 0;
+
+uint8_t frame_map[10];
+bool frame_show_statics    = false;
+bool frame_show_locals     = true;
+bool frame_show_args       = true;
+bool frame_show_scope_only = false;
 
 const char *relpath(const char *path) {
     size_t pwd_len = strlen(pwd);
@@ -37,16 +56,45 @@ const char *relpath(const char *path) {
     }
 }
 
-void kak_jump(SBLineEntry line_entry) {
+void inlay_values(SBFrame frame) {
     FILE* cmd = popen(kak_cmd_string, "w");
-    SBFileSpec spec = line_entry.GetFileSpec();
 
-    if (!cmd)
+    if (!cmd) {
         return;
+    }
 
+	char path[256];
+    frame.GetLineEntry().GetFileSpec().GetPath(path, 256); 
+// eval -buffer * %%{unset buffer lldb_values}; 
+    fprintf(cmd, "eval -buffer %s %%{set buffer lldb_values %%val{timestamp} ", relpath(path));
+    SBValueList values = frame.GetVariables(true, true, false, true);
+    for (int i = 0; i < values.GetSize(); i++) {
+        SBValue val = values.GetValueAtIndex(i);
+        SBDeclaration decl = val.GetDeclaration();
+        if (!decl.IsValid())
+            continue;
+
+        const char *val_str = val.GetSummary();
+
+        if (val_str == nullptr)
+            val_str = val.GetValue();
+
+        if (val_str != nullptr)
+            fprintf(cmd, "\"%d.%d+0| = %s\" ", decl.GetLine(), decl.GetColumn(), val_str);
+    }
+    fprintf(cmd, "}\n");
+    pclose(cmd);
+}
+
+void kak_jump(SBLineEntry line_entry) {
+    SBFileSpec spec = line_entry.GetFileSpec();
     if (!spec.Exists()) {
-        fputs("fail testing besting best\n", cmd);
-        pclose(cmd);
+        return;
+    }
+
+    FILE* cmd = popen(kak_cmd_string, "w");
+
+    if (!cmd) {
         return;
     }
 
@@ -60,18 +108,13 @@ void kak_jump(SBLineEntry line_entry) {
     fprintf(cmd, "eval -try-client client0 %%{e %s %u %u; addhl -override buffer/lldb-line line %d ,rgb:333333}\n",
             path, jump_line, line_entry.GetColumn(), jump_line);
 
-    // fprintf(cmd, "addhl -override buffer/lldb-line line %d bright-black\n", jump_line);
-    // fprintf(cmd, "addhl -override buffer=%s/lldb-line line %d bright-black\n", rp, jump_line);
-    fprintf(stderr, "highlighting: %s:%d\n", rp, jump_line);
     pclose(cmd);
 }
 
 void breakpoints_line_flags(SBEvent event) {
     BreakpointEventType type = SBBreakpoint::GetBreakpointEventTypeFromEvent(event); 
-    SBBreakpoint bp = SBBreakpoint::GetBreakpointFromEvent(event);
-
     bool remove = false;
-    const char *add_color = NULL;
+    const char *add_color = nullptr;
 
     switch (type) {
     case eBreakpointEventTypeRemoved:
@@ -79,35 +122,39 @@ void breakpoints_line_flags(SBEvent event) {
         remove = true;
         break;
     case eBreakpointEventTypeDisabled:
-        remove = true;
         add_color = "blue";
         break;
     case eBreakpointEventTypeAdded:
     case eBreakpointEventTypeLocationsAdded:
     case eBreakpointEventTypeLocationsResolved:
-        add_color = "red";
-        break;
     case eBreakpointEventTypeEnabled:
         add_color = "red";
-        remove = true;
         break;
+    case eBreakpointEventTypeIgnoreChanged:
+    case eBreakpointEventTypeAutoContinueChanged:
     case eBreakpointEventTypeCommandChanged:
     case eBreakpointEventTypeConditionChanged:
     case eBreakpointEventTypeThreadChanged:
-    case eBreakpointEventTypeAutoContinueChanged:
     case eBreakpointEventTypeInvalidType:
-    case eBreakpointEventTypeIgnoreChanged:
-    default:
-        break;
+        return;
     }
 
     FILE* cmd = popen(kak_cmd_string, "w");
     if (!cmd)
         return;
-    // for (int i = 0; i < SBBreakpoint::GetNumBreakpointLocationsFromEvent(event); i++) {
-        // SBBreakpointLocation loc = SBBreakpoint::GetBreakpointLocationAtIndexFromEvent(event, i); 
-    for (int i = 0; i < bp.GetNumLocations(); i++) {
-        SBBreakpointLocation loc = bp.GetLocationAtIndex(i); 
+
+    uint32_t num_locs = SBBreakpoint::GetNumBreakpointLocationsFromEvent(event);
+    bool use_breakpoint = num_locs == 0;
+    SBBreakpoint bp;
+
+    if (use_breakpoint) {
+        bp = SBBreakpoint::GetBreakpointFromEvent(event);
+        num_locs = bp.GetNumLocations();
+    }
+
+    for (int i = 0; i < num_locs; i++) {
+        SBBreakpointLocation loc = use_breakpoint ? bp.GetLocationAtIndex(i) :
+                SBBreakpoint::GetBreakpointLocationAtIndexFromEvent(event, i);
         SBLineEntry line = loc.GetAddress().GetLineEntry();
         SBFileSpec file = line.GetFileSpec();
 
@@ -119,12 +166,19 @@ void breakpoints_line_flags(SBEvent event) {
         file.GetPath(path, 255);
         const char *rp = relpath(path);
 
-        if (remove) {
+        if (remove && line_flags.find(line_no) != line_flags.end()) {
             fprintf(cmd, "set-option -remove buffer=%s lldb_flags %d|{%s}●\n", rp, line_no, line_flags.at(line_no));
             line_flags.erase(line_no);
         }
 
         if (add_color) {
+            if (line_flags.find(line_no) != line_flags.end()) {
+                if (strcmp(add_color, line_flags.at(line_no)) == 0)
+                    continue;
+
+                fprintf(cmd, "set-option -remove buffer=%s lldb_flags %d|{%s}●\n", rp, line_no, line_flags.at(line_no));
+            }
+
             line_flags[line_no] = add_color;
             fprintf(cmd, "set-option -add buffer=%s lldb_flags %d|{%s}●\n", rp, line_no, add_color);
         }
@@ -133,46 +187,103 @@ void breakpoints_line_flags(SBEvent event) {
     pclose(cmd);
 }
 
-void write_breakpoints() {
+void write_breakpoints(SBDebugger debugger) {
     FILE *file = fopen(path_breakpoints, "w");
-    SBTarget target = ::debugger->GetSelectedTarget();
+    SBTarget target = debugger.GetSelectedTarget();
     char path[256];
 
     for (int i = 0; i < target.GetNumBreakpoints(); i++) {
         SBBreakpoint bp = target.GetBreakpointAtIndex(i);
         const char *condition = bp.GetCondition();
+        if (strlen(condition) == 0)
+            condition = NULL;
+
+        const break_id_t id = bp.GetID();
+        const size_t num_locs = bp.GetNumLocations();
+
+        SBBreakpointLocation loc = bp.GetLocationAtIndex(0);
+        SBAddress address = loc.GetAddress();
+        SBLineEntry line = address.GetLineEntry();
+        line.GetFileSpec().GetPath(path, 256);
+
+        fprintf(file, "%d", id);
+
+        if (num_locs == 1)
+            fprintf(file, "\t%s", address.GetFunction().GetDisplayName());
+
+        fprintf(file, "\thit %d ign %d (%s%s%s)",
+            bp.GetHitCount(), bp.GetIgnoreCount(),
+            bp.IsEnabled() ? "" : "d", bp.IsOneShot() ? "o" : "",
+            bp.GetAutoContinue() ? "a" : "");
+
+        if (condition) {
+            fprintf(file, " condition:\"%s\"", condition);
+        }
+
+        SBStringList stopCommands;
+        if (bp.GetCommandLineCommands(stopCommands)) {
+            fprintf(file, " command:");
+            for (int i = 0; i < stopCommands.GetSize(); i++) {
+                fprintf(file, " %s;", stopCommands.GetStringAtIndex(i));
+            }
+        }
+
+        if (num_locs == 1)
+            fprintf(file, "\t%s:%d:%d", relpath(path), line.GetLine(), line.GetColumn());
+
+        fprintf(file, "\n");
+
+        if (num_locs == 1)
+            continue;
 
         for (int j = 0; j < bp.GetNumLocations(); j++) {
-            SBBreakpointLocation location = bp.GetLocationAtIndex(j); 
-            SBAddress address = location.GetAddress();
+            SBBreakpointLocation loc = bp.GetLocationAtIndex(j);
+            SBAddress address = loc.GetAddress();
             SBLineEntry line = address.GetLineEntry();
             line.GetFileSpec().GetPath(path, 256);
+            const char *condition = loc.GetCondition();
+            if (strlen(condition) == 0)
+                condition = NULL;
 
-            fprintf(file, "%d.%d %s hit:%d ignore:%d%s%s\"%s\" %s:%d:%d\n", bp.GetID(), j+1,
-                address.GetFunction().GetDisplayName(), bp.GetHitCount(),
-                bp.GetIgnoreCount(), bp.IsOneShot() ? " oneshot" : "",
-                condition ? " condition: " : "", condition ? condition : "",
-                path, line.GetLine(), line.GetColumn());
+            fprintf(file, "%d.%d\t%s\thit %d ign %d (%s%s%s)", id, loc.GetID(),
+                address.GetFunction().GetDisplayName(), loc.GetHitCount(),
+                loc.GetIgnoreCount(), loc.IsEnabled() ? "" : "d",
+                loc.IsResolved() ? "" : "u" , loc.GetAutoContinue() ? "a" : "");
+
+            if (condition)
+                fprintf(file, " condition:\"%s\"", condition);
+            
+            fprintf(file, "\t%s:%d:%d", relpath(path), line.GetLine(), line.GetColumn());
+
+            SBStringList stopCommands;
+            if (bp.GetCommandLineCommands(stopCommands)) {
+                fprintf(file, " command:");
+                for (int i = 0; i < stopCommands.GetSize(); i++) {
+                    const char *cmd = stopCommands.GetStringAtIndex(i);
+                    fprintf(file, "\t%s", cmd);
+                }
+            }
+            fprintf(file, "\n");
         }
     }
 
     fclose(file);
 }
 
-void write_watchpoints() {
+void write_watchpoints(SBDebugger debugger) {
     FILE *file = fopen(path_watchpoints, "w");
 
-    SBTarget target = ::debugger->GetSelectedTarget();
+    SBTarget target = debugger.GetSelectedTarget();
 
     for (int i = 0; i < target.GetNumWatchpoints(); i++) {
         SBWatchpoint wp = target.GetWatchpointAtIndex(i); 
 
         const char *condition = wp.GetCondition();
 
-        fprintf(file, "%d %s%s %lu size:%lu hit:%d ignore:%d%s%s %s%s\n", wp.GetID(), wp.GetWatchSpec(),wp.IsEnabled() ? "" : " (disabled)",
-                wp.GetWatchAddress(), wp.GetWatchSize(), wp.GetHitCount(),
-                wp.GetIgnoreCount(), condition ? " condition: " : "", condition ? condition : "", 
-                wp.IsWatchingReads() ? "r" : "", wp.IsWatchingWrites() ? "w" : "");
+        fprintf(file, "%d\t%s\t%lu size:%lu\thit %d ign %d (%s%s%s)%s%s\n", wp.GetID(),
+            wp.GetWatchSpec(), wp.GetWatchAddress(), wp.GetWatchSize(), wp.GetHitCount(),
+            wp.GetIgnoreCount(), wp.IsWatchingReads() ? "r" : "", wp.IsWatchingWrites() ? "w" : "",
+            wp.IsEnabled() ? "" : "d", condition ? "\tcondition:" : "", condition ? condition : "");
 
     }
     fclose(file);
@@ -190,10 +301,10 @@ void write_threads(SBProcess process) {
         if (thread.IsStopped())
             thread.GetStopDescription(stop_desc, 256); 
 
-        fprintf(file, "%lu %s %d %s %s %s%s\n", thread.GetThreadID(), thread.GetName(),
-                thread.GetNumFrames(), thread.GetSelectedFrame().GetDisplayFunctionName(),
-                retval.IsValid() ? retval.GetValue() : "",
-                stop_desc, thread.IsSuspended() ? " S" : "");
+        fprintf(file, "%lu\t%s\t%s%s%s\n", thread.GetThreadID(), thread.GetName(),
+                thread.GetSelectedFrame().GetDisplayFunctionName(),
+                thread.IsStopped() ? " (stopped)" : "", thread.IsSuspended() ? " (suspended)" : "");
+                // retval.IsValid() ? retval.GetValue() : "", stop_desc);
 
     }
     fclose(file);
@@ -215,21 +326,32 @@ void write_trace(SBThread thread) {
         num_frames = trace_max_depth;
     }
 
+	uint8_t frame_map_counter = 0;
     for (int i = 0; i < num_frames; i++) {
         SBFrame frame = thread.GetFrameAtIndex(i); 
         SBLineEntry line_entry = frame.GetLineEntry();
-        char plc[256] = "";
+        const char *func_name = frame.GetFunctionName();
+
+        if (frame.IsArtificial() || frame.IsHidden())
+            continue;
+
+        if (!func_name || hide_underscore_frames && func_name[0] == '_')
+            continue;
+        else {
+            frame_map[frame_map_counter] = i;
+            frame_map_counter++;
+        }
+
+        fprintf(file, "%s\t%s%s", frame.GetFunctionName(),
+            frame.GetModule().GetFileSpec().GetFilename(), frame.IsInlined() ? " (inlined)" : "");
 
         if (line_entry.IsValid()) {
             char path[256];
             line_entry.GetFileSpec().GetPath(path,256);
-            snprintf(plc, 256, "%s:%d:%d", path, line_entry.GetLine(), line_entry.GetColumn());
+            fprintf(file, "\t%s:%d:%d", relpath(path), line_entry.GetLine(), line_entry.GetColumn());
         }
 
-        // fprintf(file, "%c %s\t%s\t%s%s\n", frame == thread.GetSelectedFrame() ? '>' : ' ',
-        fprintf(file, "%s\t%s\t%s%s\n",
-                frame.GetFunctionName(), frame.GetModule().GetFileSpec().GetFilename(),
-                plc, frame.IsInlined() ? "\ti" : "");
+        fprintf(file, "\n");
 
     }
     fclose(file);
@@ -263,12 +385,18 @@ void write_value(FILE *file, SBValue val, uint32_t max_depth, uint32_t depth = 0
     }
 }
 
+void append_value(SBValue val, uint16_t maxdepth) {
+    FILE *file = fopen(path_frame, "a");
+    write_value(file, val, maxdepth);
+    fclose(file);
+}
+
 void write_frame(SBFrame frame) {
     FILE *file = fopen(path_frame, "w");
 
-    frame.GetSymbolContext(3).GetFunction().GetInstructions(frame.GetThread().GetProcess().GetTarget()); 
+    // frame.GetSymbolContext(3).GetFunction().GetInstructions(frame.GetThread().GetProcess().GetTarget()); 
 
-    SBValueList vals = frame.GetVariables(true, true, false, false);
+    SBValueList vals = frame.GetVariables(frame_show_args, frame_show_locals, frame_show_statics, frame_show_scope_only);
     for (int i = 0; i < vals.GetSize(); i++) {
         SBValue val = vals.GetValueAtIndex(i); 
         write_value(file, val, frame_max_depth);
@@ -276,7 +404,7 @@ void write_frame(SBFrame frame) {
     fclose(file);
 }
 
-void handle_event(SBEvent event) {
+void handle_event(SBDebugger debugger, SBEvent event) {
     if (SBBreakpoint::EventIsBreakpointEvent(event)) {
         BreakpointEventType type = SBBreakpoint::GetBreakpointEventTypeFromEvent(event); 
         SBBreakpoint bp = SBBreakpoint::GetBreakpointFromEvent(event);
@@ -295,7 +423,7 @@ void handle_event(SBEvent event) {
         case eBreakpointEventTypeAutoContinueChanged:
         case eBreakpointEventTypeCommandChanged:
         case eBreakpointEventTypeConditionChanged:
-            write_breakpoints();
+            write_breakpoints(debugger);
             break;
         case eBreakpointEventTypeThreadChanged:
         case eBreakpointEventTypeInvalidType:
@@ -314,7 +442,7 @@ void handle_event(SBEvent event) {
             case eWatchpointEventTypeConditionChanged:
             case eWatchpointEventTypeIgnoreChanged:
             case eWatchpointEventTypeTypeChanged:
-                write_watchpoints();
+                write_watchpoints(debugger);
                 break;
             case eWatchpointEventTypeThreadChanged:
             case eWatchpointEventTypeInvalidType:
@@ -379,8 +507,10 @@ void handle_event(SBEvent event) {
                     write_trace(thread);
                 }
                 write_frame(frame);
-                // fprintf(stderr, "%s:%d:%s: kak_jumping\n", __FILE__, __LINE__, __func__);
-                kak_jump(line_entry);
+
+                if (jump_at_stop)
+                    kak_jump(line_entry);
+                inlay_values(frame); 
                 break;
             }
             case eStateRunning:
@@ -436,11 +566,11 @@ void handle_event(SBEvent event) {
     }
 }
 
-void log_event(SBEvent event) {
+void log_event(SBDebugger debugger, SBEvent event) {
     if (SBBreakpoint::EventIsBreakpointEvent(event)) {
         BreakpointEventType type = SBBreakpoint::GetBreakpointEventTypeFromEvent(event); 
         SBBreakpoint bp = SBBreakpoint::GetBreakpointFromEvent(event); 
-        SBBreakpoint found = ::debugger->GetSelectedTarget().FindBreakpointByID(bp.GetID()); 
+        SBBreakpoint found = debugger.GetSelectedTarget().FindBreakpointByID(bp.GetID()); 
 
         switch (type) {
             case eBreakpointEventTypeAdded:
@@ -472,7 +602,7 @@ void log_event(SBEvent event) {
         }
     } 
     if (SBWatchpoint::EventIsWatchpointEvent(event)) {
-        	fprintf(stderr, "EventIsWatchpointEvent\n");
+    	// fprintf(stderr, "EventIsWatchpointEvent\n");
         WatchpointEventType type = SBWatchpoint::GetWatchpointEventTypeFromEvent(event); 
         switch (type) {
             case eWatchpointEventTypeAdded:
@@ -498,7 +628,7 @@ void log_event(SBEvent event) {
         }
     } 
     if (SBThread::EventIsThreadEvent(event)) {
-        	fprintf(stderr, "EventIsThreadEvent\n");
+    	// fprintf(stderr, "EventIsThreadEvent\n");
 
         uint32_t mask = event.GetType();
         if (mask & SBThread::eBroadcastBitStackChanged) 
@@ -514,7 +644,7 @@ void log_event(SBEvent event) {
         
     } 
     if (SBProcess::EventIsProcessEvent(event)) {
-        	fprintf(stderr, "EventIsProcessEvent\n");
+    	// fprintf(stderr, "EventIsProcessEvent\n");
         StateType state = SBProcess::GetStateFromEvent(event);
 
         uint32_t mask = event.GetType();
@@ -561,7 +691,7 @@ void log_event(SBEvent event) {
         	fprintf(stderr, "eBroadcastBitStructuredData\n");
     } 
     if (SBTarget::EventIsTargetEvent(event)) {
-        	fprintf(stderr, "EventIsTargetEvent\n");
+    	// fprintf(stderr, "EventIsTargetEvent\n");
         uint32_t mask = event.GetType();
         if (mask & SBTarget::eBroadcastBitBreakpointChanged) 
         	fprintf(stderr, "eBroadcastBitBreakpointChanged\n");
@@ -580,13 +710,12 @@ void log_event(SBEvent event) {
 
 void event_loop(SBDebugger debugger) {
     SBListener listener("kak_listener");
-    ::debugger = &debugger;
 
     uint32_t target_mask = SBTarget::eBroadcastBitBreakpointChanged
             // | SBTarget::eBroadcastBitModulesLoaded
             // | SBTarget::eBroadcastBitModulesUnloaded
             | SBTarget::eBroadcastBitWatchpointChanged
-            // | SBTarget::eBroadcastBitSymbolsLoaded
+            | SBTarget::eBroadcastBitSymbolsLoaded
             | SBTarget::eBroadcastBitSymbolsChanged;
 
     uint32_t thread_mask = SBThread::eBroadcastBitSelectedFrameChanged
@@ -613,103 +742,104 @@ void event_loop(SBDebugger debugger) {
     SBEvent event;
     while (running) {
         if (listener.WaitForEvent(UINT32_MAX, event)) {
-            log_event(event); 
-            handle_event(event);
+            log_event(debugger, event); 
+            handle_event(debugger, event);
         }
     }
 }
 
-enum Command {
-    invalid,
-    array_to_pointer,
-    toggle_trace_all,
-    var_depth,
-    jump,
-    show_value,
-    frame_select,
-    breakpoint,
+#define CMDLIST               \
+CMD(invalid)                  \
+CMD(array_to_pointer)         \
+CMD(toggle_trace_all)         \
+CMD(var_depth)                \
+CMD(jump)                     \
+CMD(show_value)               \
+CMD(toggle_underscore_frames) \
+CMD(frame_select)             \
+CMD(frame_toggle_statics)     \
+CMD(frame_toggle_args)        \
+CMD(frame_toggle_scope_only)  \
+CMD(frame_toggle_locals)      \
+
+enum COMMAND {
+#define CMD(name) CMD_##name,
+    CMDLIST
+#undef CMD
 };
 
-Command command_from_string(const char *str) {
-    if (strcmp(str, "array_to_pointer") == 0) {
-        return array_to_pointer;
-    }
-    if (strcmp(str, "toggle_trace_all") == 0) {
-        return toggle_trace_all;
-    }
-    if (strcmp(str, "var_depth") == 0) {
-        return var_depth;
-    }
-    if (strcmp(str, "jump") == 0) {
-        return jump;
-    }
-    if (strcmp(str, "show_value") == 0) {
-        return show_value;
-    }
-    if (strcmp(str, "frame_select") == 0) {
-        return frame_select;
-    }
-    if (strcmp(str, "breakpoint") == 0) {
-        return breakpoint;
-    }
-
-    return invalid;
+enum COMMAND command_from_str(const char *str) {
+#define CMD(name) if (strcmp(str, #name) == 0) return CMD_##name;
+    CMDLIST
+#undef CMD
+    return CMD_invalid;
 }
 
 class KakCmd : public SBCommandPluginInterface {
 public:
     virtual bool DoExecute(SBDebugger debugger, char ** command,
                            SBCommandReturnObject & result) override {
-        uint32_t depth;
-        FILE *file = fopen(path_frame, "a");
-        SBValue val;
-        SBThread thread;
-
-        switch (command_from_string(command[0])) {
-        case invalid:
+        switch (command_from_str(command[0])) {
+        case CMD_invalid:
             break;
-        case toggle_trace_all:
+        case CMD_toggle_trace_all:
             trace_all_threads = !trace_all_threads;
             break;
-        case var_depth:
-            depth = atoi(command[1]);
-            frame_max_depth = depth;
-            write_frame(::debugger->GetSelectedTarget()
+        case CMD_var_depth:
+            frame_max_depth = atoi(command[1]);
+            write_frame(debugger.GetSelectedTarget()
                         .GetProcess().GetSelectedThread()
                         .GetSelectedFrame());
             break;
-        case show_value:
-            val = ::debugger->GetSelectedTarget()
+        case CMD_show_value: {
+            SBValue val = debugger.GetSelectedTarget()
                     .GetProcess().GetSelectedThread()
                     .GetSelectedFrame().GetValueForVariablePath(command[1]);
 
-            depth = atoi(command[2]);
-            write_value(file, val, depth + 1);
-           break;
-        case array_to_pointer:
-            val = ::debugger->GetSelectedTarget()
-                    .GetProcess().GetSelectedThread()
-                    .GetSelectedFrame().GetValueForVariablePath(command[1]);
-
-            depth = atoi(command[2]);
-            write_value(file, val, depth + 1);
+            append_value(val, atoi(command[1]) + 1);
             break;
-        case jump:
-            kak_jump(::debugger->GetSelectedTarget()
+        }
+        case CMD_array_to_pointer: {
+            SBValue val = debugger.GetSelectedTarget()
+                    .GetProcess().GetSelectedThread()
+                    .GetSelectedFrame().GetValueForVariablePath(command[1]);
+
+            append_value(val, atoi(command[1]) + 1);
+            break;
+        }
+        case CMD_frame_select: {
+            uint8_t frame_idx = atoi(command[1]) - 1;
+            if (hide_underscore_frames)
+                frame_idx = frame_map[frame_idx];
+            SBThread thread =  debugger.GetSelectedTarget().GetProcess().GetSelectedThread();
+            thread.SetSelectedFrame(frame_idx);
+            write_frame(thread.GetSelectedFrame());
+            break;
+        }
+        case CMD_jump:
+            kak_jump(debugger.GetSelectedTarget()
                         .GetProcess().GetSelectedThread()
                         .GetSelectedFrame().GetLineEntry());
             break;
-        // case frame_select:
-        //     thread = ::debugger->GetSelectedTarget()
-        //                 .GetProcess().GetSelectedThread();
-        //     thread.SetSelectedFrame(atoi(command[1] - 1)); 
-        //     write_frame(thread.GetSelectedFrame());
-        //     break;
-        case breakpoint:
-            write_breakpoints();
+        case CMD_toggle_underscore_frames:
+            hide_underscore_frames = !hide_underscore_frames;
+            write_frame(debugger.GetSelectedTarget()
+                        .GetProcess().GetSelectedThread()
+                        .GetSelectedFrame());
+            break;
+        case CMD_frame_toggle_statics:
+            frame_show_statics = !frame_show_statics;
+            break;
+        case CMD_frame_toggle_args:
+            frame_show_args = !frame_show_args;
+            break;
+        case CMD_frame_toggle_scope_only:
+            frame_show_scope_only = !frame_show_scope_only;
+            break;
+        case CMD_frame_toggle_locals:
+            frame_show_locals = !frame_show_locals;
             break;
         }
-        fclose(file);
         return true;
     }
 };
@@ -726,12 +856,12 @@ API bool PluginInitialize(SBDebugger debugger)
     if (kak_session == NULL || sh_fifo == NULL)
         return false;
 
-    snprintf(kak_cmd_string, 64, "kak -p %s", kak_session);
-    snprintf(path_breakpoints, 64, "%s/breakpoints", sh_fifo);
-    snprintf(path_watchpoints, 64, "%s/watchpoints", sh_fifo);
-    snprintf(path_threads, 64, "%s/threads", sh_fifo);
-    snprintf(path_frames, 64, "%s/trace", sh_fifo);
-    snprintf(path_frame, 64, "%s/frame", sh_fifo);
+    snprintf(kak_cmd_string, 256, "kak -p %s", kak_session);
+    snprintf(path_breakpoints, 256, "%s/breakpoints", sh_fifo);
+    snprintf(path_watchpoints, 256, "%s/watchpoints", sh_fifo);
+    snprintf(path_threads, 256, "%s/threads", sh_fifo);
+    snprintf(path_frames, 256, "%s/trace", sh_fifo);
+    snprintf(path_frame, 256, "%s/frame", sh_fifo);
 
     debugger.GetCommandInterpreter().AddCommand("kak", new KakCmd(), "kakoune commands");
 
